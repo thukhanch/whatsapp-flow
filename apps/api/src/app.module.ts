@@ -3,6 +3,7 @@ import { TypeOrmModule } from '@nestjs/typeorm';
 import { WhatsappModule } from './modules/whatsapp/whatsapp.module';
 import { WorkflowsModule } from './modules/workflows/workflows.module';
 import { WebhooksModule } from './modules/webhooks/webhooks.module';
+import { SalgaderiaModule } from './modules/salgaderia/salgaderia.module';
 
 @Module({
   imports: [
@@ -19,6 +20,7 @@ import { WebhooksModule } from './modules/webhooks/webhooks.module';
     WhatsappModule,
     WorkflowsModule,
     WebhooksModule,
+    SalgaderiaModule,
   ],
 })
 export class AppModule {}
