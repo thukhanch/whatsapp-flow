@@ -74,7 +74,7 @@ export class AiService {
     'IMPORTANTE: Na saudacao inicial, sempre se apresente como atendimento da Duzzi Salgados e pergunte como pode ajudar.',
   ].join(String.fromCharCode(10));
 
-  private readonly outputSchemaPrompt = `Responda EXCLUSIVAMENTE em JSON valido, sem texto adicional, neste formato:
+  private readonly outputSchemaPrompt = `INSTRUCAO CRITICA: sua resposta deve comecar com { e terminar com }. Nenhum texto fora do JSON. Responda EXCLUSIVAMENTE em JSON valido, sem texto adicional, neste formato:
 {
   "replyToCustomer": "texto unico para o cliente",
   "toolCalls": [
@@ -145,19 +145,28 @@ REGRAS:
 
     const latestUserTurnMsg = `ULTIMA MENSAGEM DO CLIENTE (prioridade maxima): ${message}`;
 
+    const dadosResumo = state.dados ? Object.entries(state.dados)
+      .filter(([, v]) => v !== null && v !== undefined && v !== '')
+      .map(([k, v]) => `${k}=${v}`).join(', ') : '';
+
+    const historicoRecente = state.historico.slice(-6)
+      .map(m => `${m.role === 'user' ? 'Cliente' : 'Atendente'}: ${m.content}`)
+      .join('\n');
+
+    const systemContent = `DUZZI SALGADOS - Atendente Virtual
+PRODUTO: Coxinha R$1,00/cada. Minimo 25. Multiplos de 25 (25,50,75,100...).
+MODALIDADE: Somente retirada no balcao. SEM entrega. SEM frete.
+PAGAMENTO: Somente no balcao na retirada. SEM PIX. SEM antecipado.
+DADOS JA COLETADOS: ${dadosResumo || 'nenhum'}
+HISTORICO RECENTE:
+${historicoRecente || 'primeira mensagem'}
+ULTIMA MENSAGEM: ${message}
+INSTRUCAO: Responda naturalmente como atendente. Se quantidade invalida, recuse e proponha multiplo de 25. Nunca mencione pagamento. Faca resumo e peca confirmacao antes de fechar pedido.
+FORMATO: Responda APENAS em JSON: {"replyToCustomer":"texto","needsHuman":false,"shouldCreateOrder":false,"dados":{"nome":null,"quantidade":null,"data_agendamento":null,"horario_agendamento":null}}`;
+
     const chatMessages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
-      { role: 'system', content: systemPrompt },
-      { role: 'system', content: this.responseStylePrompt },
-      { role: 'system', content: contextMsg },
-      { role: 'system', content: memoryMsg },
-      { role: 'system', content: toolMsg },
-      ...state.historico.slice(-12).map((msg) => ({
-        role: msg.role as 'user' | 'assistant',
-        content: msg.content,
-      })),
-      { role: 'system', content: latestUserTurnMsg },
+      { role: 'system', content: systemContent },
       { role: 'user', content: message },
-      { role: 'system', content: this.outputSchemaPrompt },
     ];
 
     try {
@@ -165,7 +174,7 @@ REGRAS:
         this.baseUrl,
         {
           model: this.model,
-          temperature: 0.6,
+          temperature: 0.4,
           messages: chatMessages,
         },
         {
@@ -179,6 +188,7 @@ REGRAS:
         },
       );
 
+      this.logger.log(`OpenRouter full response: ${JSON.stringify(response.data)}`);
       let content = response.data?.choices?.[0]?.message?.content;
       this.logger.log(`OpenRouter raw response: ${content}`);
 
@@ -187,6 +197,54 @@ REGRAS:
       }
 
       content = content.replace(/^```\w*\s*/i, '').replace(/```\s*$/i, '').trim();
+
+      if (!content.trim().startsWith('{')) {
+        this.logger.log('Resposta nao e JSON, reprocessando...');
+        const hoje = new Date().toISOString().slice(0, 10);
+        const reprocessResponse = await axios.post(
+          this.baseUrl,
+          {
+            model: this.model,
+            temperature: 0.1,
+            messages: [
+              {
+                role: 'system',
+                content: `Voce converte texto em JSON. Hoje e ${hoje}. Retorne APENAS o JSON, sem explicacoes.
+O formato obrigatorio e:
+{
+  "replyToCustomer": "resposta ao cliente",
+  "toolCalls": [],
+  "memoryUpdates": {
+    "etapaAtual": null,
+    "dados": { "nome": null, "quantidade": null, "data_agendamento": null, "data_exibicao": null, "horario_agendamento": null },
+    "pendencias": [],
+    "resumoInterno": null
+  },
+  "needsHuman": false,
+  "shouldCreateOrder": false
+}
+Extraia o replyToCustomer do texto. Se o texto mencionar handoff ou humano, needsHuman=true.`,
+              },
+              {
+                role: 'user',
+                content: `Converta para JSON: "${content}"`,
+              },
+            ],
+          },
+          {
+            headers: {
+              Authorization: `Bearer ${this.apiKey}`,
+              'Content-Type': 'application/json',
+              'HTTP-Referer': 'http://localhost:3000',
+              'X-Title': 'Duzzi Salgados',
+            },
+            timeout: 30000,
+          },
+        );
+        content = reprocessResponse.data?.choices?.[0]?.message?.content || content;
+        content = content.replace(/^```\w*\s*/i, '').replace(/```\s*$/i, '').trim();
+        this.logger.log(`Reprocessado: ${content}`);
+      }
 
       const repairJson = (raw: string): string => {
         let out = '';
@@ -204,8 +262,21 @@ REGRAS:
         return out;
       };
 
-      const parsed = JSON.parse(repairJson(content)) as AtendimentoAiResult;
-      return this.sanitizeAiResult(parsed, state);
+      let parsed: any;
+      try {
+        parsed = JSON.parse(repairJson(content));
+      } catch {
+        parsed = { replyToCustomer: content, toolCalls: [], memoryUpdates: {}, needsHuman: false, shouldCreateOrder: false };
+      }
+
+      if (!parsed.memoryUpdates) parsed.memoryUpdates = {};
+      if (!parsed.toolCalls) parsed.toolCalls = [];
+      if (parsed.dados) {
+        parsed.memoryUpdates.dados = parsed.dados;
+        delete parsed.dados;
+      }
+
+      return this.sanitizeAiResult(parsed as AtendimentoAiResult, state);
     } catch (error: any) {
       this.logger.error(`Falha ao executar motor de IA: ${error?.message ?? error}`);
       throw error;
